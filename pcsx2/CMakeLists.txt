@@ -86,6 +86,7 @@ set(pcsx2Sources
 	IopHw.cpp
 	IopIrq.cpp
 	IopMem.cpp
+	ControlServer.cpp
 	PINE.cpp
 	Mdec.cpp
 	Memory.cpp
@@ -167,6 +168,7 @@ set(pcsx2Headers
 	IopHw.h
 	IopMem.h
 	LayeredSettingsInterface.h
+	ControlServer.h
 	PINE.h
 	Mdec.h
 	MTGS.h
@@ -1146,6 +1148,7 @@ target_link_libraries(PCSX2_FLAGS INTERFACE
 	rcheevos
 	discord-rpc
 	simpleini
+	rapidjson
 	freesurround
 	Freetype::Freetype
 	SDL3::SDL3

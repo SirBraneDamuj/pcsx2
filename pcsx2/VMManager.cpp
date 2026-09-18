@@ -24,6 +24,7 @@
 #include "IopBios.h"
 #include "MTGS.h"
 #include "MTVU.h"
+#include "ControlServer.h"
 #include "PINE.h"
 #include "Patch.h"
 #include "PerformanceMetrics.h"
@@ -135,6 +136,7 @@ namespace VMManager
 	static void ResetResumeTimestamp();
 	static void SaveSessionTime(const std::string& prev_serial);
 	static void ReloadPINE();
+	static void ReloadControlServer();
 
 	static float GetTargetSpeedForLimiterMode(LimiterModeType mode);
 	static void ResetFrameLimiter();
@@ -311,6 +313,8 @@ void VMManager::SetState(VMState state)
 		// If stopping, break execution as soon as possible.
 		Cpu->ExitExecution();
 	}
+
+	ControlServer::Internal::OnVMStateChanged(state);
 }
 
 bool VMManager::HasValidVM()
@@ -425,6 +429,7 @@ bool VMManager::Internal::CPUThreadInitialize()
 		Achievements::Initialize();
 
 	ReloadPINE();
+	ReloadControlServer();
 
 	if (EmuConfig.EnableDiscordPresence)
 		InitializeDiscordPresence();
@@ -441,6 +446,10 @@ void VMManager::Internal::CPUThreadShutdown()
 	ShutdownDiscordPresence();
 
 	PINEServer::Deinitialize();
+
+	// Before MTGS::ShutdownThread() and SysMemory::Release() below: a pending screenshot or
+	// memory read must not outlive the GS thread or the vtlb map it is reading from.
+	ControlServer::Deinitialize();
 
 	Achievements::Shutdown(false);
 
@@ -2910,6 +2919,8 @@ void VMManager::Internal::EntryPointCompilingOnCPUThread()
 
 void VMManager::Internal::VSyncOnCPUThread()
 {
+	ControlServer::Internal::OnVSyncOnCPUThread();
+
 	Pad::UpdateMacroButtons();
 
 	Patch::ApplyVsyncPatches();
@@ -2921,6 +2932,10 @@ void VMManager::Internal::VSyncOnCPUThread()
 		s_frame_advance_count--;
 		if (s_frame_advance_count == 0)
 		{
+			// Claim the step *before* SetState below, otherwise OnVMStateChanged() would see
+			// a still-active step going to Paused and report it as an interruption.
+			ControlServer::Internal::OnFrameAdvanceCompleted();
+
 			// auto pause at the end of frame advance
 			SetState(VMState::Paused);
 		}
@@ -2935,6 +2950,11 @@ void VMManager::Internal::PollInputOnCPUThread()
 {
 	Host::PumpMessagesOnCPUThread();
 	InputManager::PollSources();
+
+	// After PollSources() so a real controller plugged in at the same time cannot clobber
+	// an injected frame, and before the input-recording block below so that playback still
+	// wins if the user has deliberately started one.
+	ControlServer::Internal::OnPollInputOnCPUThread();
 
 	if (EmuConfig.EnableRecordingTools)
 	{
@@ -3112,6 +3132,10 @@ void VMManager::CheckForMiscConfigChanges(const Pcsx2Config& old_config)
 	{
 		SetEmuThreadAffinities();
 	}
+
+	// Unlike PINE, which only reloads on a game change, this picks the toggle up as soon as
+	// the settings are applied.
+	ReloadControlServer();
 }
 
 void VMManager::CheckForConfigChanges(const Pcsx2Config& old_config)
@@ -3772,6 +3796,19 @@ void VMManager::ReloadPINE()
 
 	if (EmuConfig.EnablePINE)
 		PINEServer::Initialize(EmuConfig.PINESlot);
+}
+
+void VMManager::ReloadControlServer()
+{
+	const bool enabled = EmuConfig.EnableControlServer;
+	const bool running = ControlServer::IsInitialized();
+	if (enabled == running && (!running || ControlServer::GetPort() == EmuConfig.ControlServerPort))
+		return;
+
+	ControlServer::Deinitialize();
+
+	if (enabled)
+		ControlServer::Initialize(EmuConfig.ControlServerPort);
 }
 
 void VMManager::InitializeDiscordPresence()
