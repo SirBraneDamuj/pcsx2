@@ -1123,7 +1123,9 @@ bool GSDevice12::CreateSwapChain()
 			&fs_desc, fullscreen_output.get(), m_swap_chain.put());
 		if (FAILED(hr))
 		{
-			Console.Warning("D3D12: Failed to create fullscreen swap chain, trying windowed.");
+			Console.WarningFmt("D3D12: Failed to create fullscreen swap chain, trying windowed: {}",
+				Error::CreateHResult(hr).GetDescription());
+			m_swap_chain.reset();
 			m_is_exclusive_fullscreen = false;
 			m_using_allow_tearing = m_allow_tearing_supported;
 		}
@@ -1136,7 +1138,11 @@ bool GSDevice12::CreateSwapChain()
 			m_command_queue.get(), window_hwnd, &swap_chain_desc, nullptr, nullptr, m_swap_chain.put());
 
 		if (FAILED(hr))
-			Console.Warning("D3D12: Failed to create windowed swap chain.");
+		{
+			Console.ErrorFmt("D3D12: Failed to create windowed swap chain: {}", Error::CreateHResult(hr).GetDescription());
+			m_swap_chain.reset();
+			return false;
+		}
 	}
 
 	// MWA needs to be called on the correct factory.
