@@ -125,3 +125,6 @@ CMakeSettings.json
 /ci-artifacts/
 /out/
 /.cache/
+
+# Git Bash crash debris
+bash.exe.stackdump
