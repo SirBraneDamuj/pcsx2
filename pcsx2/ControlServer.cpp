@@ -6,6 +6,7 @@
 #include "Common.h"
 #include "ControlServer.h"
 #include "Counters.h"
+#include "GS/GS.h"
 #include "Host.h"
 #include "MTGS.h"
 #include "SIO/Pad/Pad.h"
@@ -118,6 +119,13 @@ namespace ControlServer
 	// off a spinning disk is slower still.
 	static constexpr u32 DEFAULT_SAVE_STATE_TIMEOUT_MS = 60000;
 
+	// A GS dump is armed now and written by the renderer over the next several vsyncs, so
+	// the op has to drive frames until it closes. The budget is generous because the number
+	// of vsyncs it takes is not fixed -- see OpGsDump().
+	static constexpr u32 DEFAULT_GS_DUMP_TIMEOUT_MS = 30000;
+	static constexpr u32 GS_DUMP_POLL_FRAMES = 2;
+	static constexpr u32 GS_DUMP_MAX_FRAMES = 120;
+
 	// Matches SaveState_SaveScreenshot(). A fixed size keeps captures comparable between
 	// runs, which matters more for a harness than matching the window.
 	static constexpr u32 SCREENSHOT_WIDTH = 640;
@@ -197,6 +205,10 @@ namespace ControlServer
 		u32 img_height = 0;
 		std::vector<u32> pixels;
 
+		// gs_dump: whether the renderer still holds the dump file open. Written on the CPU
+		// thread before Complete(), same as the screenshot payload above.
+		bool gs_dump_running = false;
+
 		void Complete(ErrorCode code, std::string msg = {})
 		{
 			{
@@ -229,6 +241,14 @@ namespace ControlServer
 					*out_pixels = std::move(pixels);
 			}
 			return error;
+		}
+
+		/// Only meaningful once Take() has returned None, for the same reason the screenshot
+		/// payload is: before that the CPU-thread half may still be writing it.
+		bool TakeGsDumpRunning()
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			return gs_dump_running;
 		}
 	};
 
@@ -1042,6 +1062,34 @@ namespace ControlServer
 		// Completion arrives later, via Internal::OnFrameAdvanceCompleted().
 	}
 
+	/// Runs a frame advance and waits for it. Shared by OpStep() and OpGsDump(), which has
+	/// to advance frames itself when the VM is paused -- a paused machine emits no vsyncs,
+	/// and without vsyncs the renderer never writes the dump it was handed.
+	static ErrorCode RunStepFrames(u32 frames, u32 timeout_ms, std::string* message)
+	{
+		const std::shared_ptr<Job> job = std::make_shared<Job>();
+		{
+			std::lock_guard<std::mutex> lock(s_step_mtx);
+			if (s_active_step)
+			{
+				*message = "a step is already in flight";
+				return ErrorCode::Busy;
+			}
+			s_active_step = job;
+		}
+
+		RunJob(job, timeout_ms, [job, frames]() { StartFrameAdvanceOnCPUThread(job, frames); });
+
+		// However it ended -- completion, interruption or timeout -- this step is over.
+		{
+			std::lock_guard<std::mutex> lock(s_step_mtx);
+			if (s_active_step == job)
+				s_active_step.reset();
+		}
+
+		return job->Take(message);
+	}
+
 	static void OpStep(const rapidjson::Value& request, ReplyContext& ctx)
 	{
 		u32 frames = 0;
@@ -1057,28 +1105,8 @@ namespace ControlServer
 		if (!GetTimeoutField(request, default_timeout_ms, &timeout_ms, ctx))
 			return;
 
-		const std::shared_ptr<Job> job = std::make_shared<Job>();
-		{
-			std::lock_guard<std::mutex> lock(s_step_mtx);
-			if (s_active_step)
-			{
-				ctx.Fail(ErrorCode::Busy, "a step is already in flight");
-				return;
-			}
-			s_active_step = job;
-		}
-
-		RunJob(job, timeout_ms, [job, frames]() { StartFrameAdvanceOnCPUThread(job, frames); });
-
-		// However it ended -- completion, interruption or timeout -- this step is over.
-		{
-			std::lock_guard<std::mutex> lock(s_step_mtx);
-			if (s_active_step == job)
-				s_active_step.reset();
-		}
-
 		std::string message;
-		const ErrorCode code = job->Take(&message);
+		const ErrorCode code = RunStepFrames(frames, timeout_ms, &message);
 		if (code != ErrorCode::None)
 		{
 			ctx.Fail(code, std::move(message));
@@ -1395,6 +1423,201 @@ namespace ControlServer
 		};
 	}
 
+	// GSQueueSnapshot() only honours a caller-supplied path when it ends in ".png", which it
+	// then strips before appending its own extensions. Normalise whatever the caller passed,
+	// with or without an extension, down to that base.
+	static std::string StripGsDumpExtension(const std::string& path)
+	{
+		static constexpr std::string_view suffixes[] = {".gs.zst", ".gs.xz", ".gs", ".png"};
+		for (const std::string_view suffix : suffixes)
+		{
+			if (path.size() > suffix.size() && StringUtil::EndsWithNoCase(path, suffix))
+				return path.substr(0, path.size() - suffix.size());
+		}
+		return path;
+	}
+
+	/// The extension the renderer will actually append. It depends on a setting the caller
+	/// cannot see, and probing the filesystem afterwards would pick the wrong file when a
+	/// stale dump written under a different compression mode is sitting next to it.
+	static const char* GsDumpExtension()
+	{
+		switch (GSConfig.GSDumpCompression)
+		{
+			case GSDumpCompressionMethod::Uncompressed:
+				return ".gs";
+			case GSDumpCompressionMethod::LZMA:
+				return ".gs.xz";
+			case GSDumpCompressionMethod::Zstandard:
+			default:
+				return ".gs.zst";
+		}
+	}
+
+	/// Must be called on the CPU thread. m_dump belongs to the renderer, so the read bounces
+	/// through the GS thread and waits rather than racing it.
+	static bool IsGsDumpRunningOnCPUThread()
+	{
+		bool running = false;
+		MTGS::RunOnGSThread([&running]() { running = GSIsDumpRunning(); });
+		MTGS::WaitGS(false, false, false);
+		return running;
+	}
+
+	static void OpGsDump(const rapidjson::Value& request, ReplyContext& ctx)
+	{
+		std::string path;
+		if (!GetPathField(request, &path, ctx))
+			return;
+
+		u32 timeout_ms = 0;
+		if (!GetTimeoutField(request, DEFAULT_GS_DUMP_TIMEOUT_MS, &timeout_ms, ctx))
+			return;
+
+		const std::string base = StripGsDumpExtension(path);
+		if (Path::GetFileName(base).empty())
+		{
+			ctx.Fail(ErrorCode::BadRequest, fmt::format("'path' has no file name ('{}')", path));
+			return;
+		}
+
+		// The renderer opens the file with fopen("wb"), which will not create the directory.
+		if (const std::string_view directory = Path::GetDirectory(base); !directory.empty())
+		{
+			const std::string dir(directory);
+			if (!FileSystem::DirectoryExists(dir.c_str()) && !FileSystem::CreateDirectoryPath(dir.c_str(), true))
+			{
+				ctx.Fail(ErrorCode::Internal, fmt::format("could not create directory '{}'", dir));
+				return;
+			}
+		}
+
+		const std::chrono::steady_clock::time_point deadline =
+			std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+		// Phase 1: arm the capture. The renderer picks it up at its next vsync.
+		{
+			const std::shared_ptr<Job> job = std::make_shared<Job>();
+			RunJob(job, timeout_ms, [job, png = base + ".png"]() {
+				if (!VMManager::HasValidVM() || !MTGS::IsOpen())
+				{
+					job->Complete(ErrorCode::NoVM, "no virtual machine is running");
+					return;
+				}
+
+				const VMState state = VMManager::GetState();
+				if (state != VMState::Running && state != VMState::Paused)
+				{
+					job->Complete(ErrorCode::BadState,
+						fmt::format("cannot dump while the VM is '{}'", VMStateName(state)));
+					return;
+				}
+
+				// QueueSnapshot() silently drops the request when one is already pending,
+				// which would otherwise look like a dump that succeeded but never appeared.
+				if (IsGsDumpRunningOnCPUThread())
+				{
+					job->Complete(ErrorCode::Busy, "a GS dump is already in progress");
+					return;
+				}
+
+				MTGS::RunOnGSThread([png]() { GSQueueSnapshot(png, 1); });
+				MTGS::WaitGS(false, false, false);
+				job->Complete(ErrorCode::None);
+			});
+
+			std::string message;
+			if (const ErrorCode code = job->Take(&message); code != ErrorCode::None)
+			{
+				ctx.Fail(code, std::move(message));
+				return;
+			}
+		}
+
+		// Phase 2: drive frames until the renderer lets go of the file. A "single frame"
+		// dump is not finished at the next vsync: GSDumpBase closes only after an even
+		// number of fields have gone by with its last-frame flag set, and it starts with two
+		// extra frames in hand -- about five vsyncs in practice, but that depends on
+		// interlacing and on what the game is doing, so poll instead of guessing a count.
+		const bool paused = (VMManager::GetState() == VMState::Paused);
+		u32 frames_advanced = 0;
+		for (;;)
+		{
+			const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+			if (now >= deadline)
+			{
+				ctx.Fail(ErrorCode::Timeout, fmt::format("the GS dump did not finish within {}ms", timeout_ms));
+				return;
+			}
+			const u32 remaining_ms = static_cast<u32>(std::max<s64>(
+				1, std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count()));
+
+			if (paused)
+			{
+				if (frames_advanced >= GS_DUMP_MAX_FRAMES)
+				{
+					ctx.Fail(ErrorCode::Internal,
+						fmt::format("the GS dump was still open after {} frames", frames_advanced));
+					return;
+				}
+
+				std::string message;
+				const ErrorCode code =
+					RunStepFrames(GS_DUMP_POLL_FRAMES, std::min(remaining_ms, DEFAULT_STEP_TIMEOUT_MS), &message);
+				if (code != ErrorCode::None)
+				{
+					ctx.Fail(code, std::move(message));
+					return;
+				}
+				frames_advanced += GS_DUMP_POLL_FRAMES;
+			}
+			else
+			{
+				// Frames are already flowing on their own; just let a couple go by.
+				std::this_thread::sleep_for(std::chrono::milliseconds(8));
+			}
+
+			const std::shared_ptr<Job> job = std::make_shared<Job>();
+			RunJob(job, std::min(remaining_ms, DEFAULT_TIMEOUT_MS), [job]() {
+				if (!VMManager::HasValidVM() || !MTGS::IsOpen())
+				{
+					job->Complete(ErrorCode::NoVM, "the VM went away while the dump was in flight");
+					return;
+				}
+				job->gs_dump_running = IsGsDumpRunningOnCPUThread();
+				job->Complete(ErrorCode::None);
+			});
+
+			std::string message;
+			if (const ErrorCode code = job->Take(&message); code != ErrorCode::None)
+			{
+				ctx.Fail(code, std::move(message));
+				return;
+			}
+			if (!job->TakeGsDumpRunning())
+				break;
+		}
+
+		std::string dump_path = base + GsDumpExtension();
+		if (!FileSystem::FileExists(dump_path.c_str()))
+		{
+			ctx.Fail(ErrorCode::Internal,
+				fmt::format("the renderer released the dump but '{}' is not there", dump_path));
+			return;
+		}
+
+		const s64 size = FileSystem::GetPathFileSize(dump_path.c_str());
+
+		ctx.payload = [dump_path = std::move(dump_path), size, frames_advanced](JsonWriter& writer) {
+			writer.Key("path");
+			WriteString(writer, dump_path);
+			writer.Key("size");
+			writer.Int64(size);
+			writer.Key("frames_advanced");
+			writer.Uint(frames_advanced);
+		};
+	}
+
 	struct PadButtonName
 	{
 		const char* name;
@@ -1628,6 +1851,8 @@ namespace ControlServer
 			OpSaveState(request, ctx);
 		else if (op == "load_state")
 			OpLoadState(request, ctx);
+		else if (op == "gs_dump")
+			OpGsDump(request, ctx);
 		else if (op == "send_input")
 			OpSendInput(request, ctx);
 		else if (op == "clear_input")

@@ -953,6 +953,13 @@ void GSRenderer::StopGSDump()
 	m_dump_frames = 0;
 }
 
+bool GSRenderer::IsGSDumpRunning() const
+{
+	// m_snapshot is also set for a plain screenshot, which is not a dump and finishes at the
+	// next VSync regardless -- so a queued request only counts while frames were asked for.
+	return static_cast<bool>(m_dump) || (!m_snapshot.empty() && m_dump_frames > 0);
+}
+
 void GSRenderer::PresentCurrentFrame()
 {
 	if (BeginPresentFrame(false))

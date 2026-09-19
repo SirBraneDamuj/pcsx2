@@ -491,6 +491,11 @@ void GSStopGSDump()
 		g_gs_renderer->StopGSDump();
 }
 
+bool GSIsDumpRunning()
+{
+	return g_gs_renderer && g_gs_renderer->IsGSDumpRunning();
+}
+
 bool GSBeginCapture(std::string filename)
 {
 	if (g_gs_renderer)

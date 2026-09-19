@@ -76,6 +76,7 @@ std::string GSGetBaseSnapshotFilename();
 std::string GSGetBaseVideoFilename();
 void GSQueueSnapshot(const std::string& path, u32 gsdump_frames = 0);
 void GSStopGSDump();
+bool GSIsDumpRunning();
 bool GSBeginCapture(std::string filename);
 void GSEndCapture();
 void GSPresentCurrentFrame();
